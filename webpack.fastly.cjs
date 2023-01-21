@@ -1,10 +1,8 @@
 const webpack = require("webpack");
 const NodePolyfillPlugin = require("node-polyfill-webpack-plugin");
 
-// developers.cloudflare.com/workers/cli-wrangler/configuration#modules
-// archive.is/FDky9
 module.exports = {
-  entry: "./src/server-workers.js",
+  entry: "./src/server-fastly.js",
   target: ["webworker", "es2020"],
   mode: "production",
   // enable devtool in development
@@ -24,6 +22,7 @@ module.exports = {
     }),
     new webpack.IgnorePlugin({
       resourceRegExp:
+        // eslint-disable-next-line max-len
         /(^dgram$)|(^http2$)|(\/deno\/.*\.ts$)|(.*-deno\.ts$)|(.*\.deno\.ts$)|(\/node\/.*\.js$)|(.*-node\.js$)|(.*\.node\.js$)/,
     }),
     // stackoverflow.com/a/65556946
@@ -44,7 +43,17 @@ module.exports = {
     library: {
       type: "module",
     },
-    filename: "worker.js",
+    filename: "fastly.js",
     module: true,
   },
+  externals: [
+    ({ request }, callback) => {
+      // Allow Webpack to handle fastly:* namespaced module imports by treating
+      // them as modules rather than try to process them as URLs
+      if (/^fastly:.*$/.test(request)) {
+        return callback(null, "commonjs " + request);
+      }
+      callback();
+    },
+  ],
 };

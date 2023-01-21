@@ -34,6 +34,7 @@ let OUR_WC_DN_RE = null; // wildcard dns name match
 let log = null;
 let noreqs = -1;
 let listeners = [];
+let nofchecks = 0;
 
 ((main) => {
   // listen for "go" and start the server
@@ -82,12 +83,17 @@ function systemUp() {
   log = util.logger("NodeJs");
   if (!log) throw new Error("logger unavailable on system up");
 
-  const onlydownload = envutil.blocklistDownloadOnly();
+  const downloadmode = envutil.blocklistDownloadOnly();
+  const profilermode = envutil.profileDnsResolves();
   const tlsoffload = envutil.isCleartext();
 
-  if (onlydownload) {
+  if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
     return;
+  } else if (profilermode) {
+    const durationms = 60 * 1000;
+    log.w("in profiler mode, run for", durationms, "and exit");
+    stopAfter(durationms);
   }
 
   if (tlsoffload) {
@@ -142,18 +148,27 @@ function systemUp() {
 
     // DNS over HTTPS
     const doh = http2
-      // serverHTTPS must eventually invoke machines-heartbeat
+      // serveHTTPS must eventually invoke machines-heartbeat
       .createSecureServer({ ...tlsOpts, allowHTTP1: true }, serveHTTPS)
       .listen(portdoh, () => up("DoH", doh.address()));
 
     // may contain null elements
     listeners = [dot1, dot2, doh];
   }
+
+  if (envutil.httpCheck()) {
+    const portcheck = envutil.httpCheckPort();
+    const hcheck = h2c
+      .createServer(serve200)
+      .listen(portcheck, () => up("http-check", hcheck.address()));
+    listeners.push(hcheck);
+  }
+
   machinesHeartbeat();
 }
 
 function down(addr) {
-  console.info(`closed: [${addr.address}]:${addr.port}`);
+  console.warn(`closed: [${addr.address}]:${addr.port}`);
 }
 
 function up(server, addr) {
@@ -241,16 +256,22 @@ function serveDoTProxyProto(clientSocket) {
   });
 }
 
-function makeScratchBuffer() {
-  const qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
-  const qlenBufOffset = bufutil.recycleBuffer(qlenBuf);
+class ScratchBuffer {
+  constructor() {
+    /** @type {Buffer} */
+    this.qlenBuf = bufutil.createBuffer(dnsutil.dnsHeaderSize);
+    /** @type {Number} */
+    this.qlenBufOffset = bufutil.recycleBuffer(this.qlenBuf);
+    this.qBuf = null;
+    this.qBufOffset = 0;
+  }
 
-  return {
-    qlenBuf: qlenBuf,
-    qlenBufOffset: qlenBufOffset,
-    qBuf: null,
-    qBufOffset: 0,
-  };
+  allocOnce(sz) {
+    if (this.qBuf === null) {
+      this.qBuf = bufutil.createBuffer(sz);
+      this.qBufOffset = bufutil.recycleBuffer(this.qBuf);
+    }
+  }
 }
 
 /**
@@ -305,9 +326,10 @@ function getDnRE(socket) {
  */
 function getMetadata(sni) {
   // 1-flag.max.rethinkdns.com => ["1-flag", "max", "rethinkdns", "com"]
+  // 1-flag.somedomain.tld => ["1-flag", "somedomain", "tld"]
   const s = sni.split(".");
-  if (s.length > 3) {
-    // ["1-flag", "max", "rethinkdns", "com"] => "max.rethinkdns.com"]
+  if (s.length > 2) {
+    // ["1-flag", "max", "rethinkdns", "com"] => "max.rethinkdns.com"
     const host = s.splice(1).join(".");
     // previously, "-" was replaced with "+" as doh handlers used "+" to
     // differentiate between a b32 flag and a b64 flag ("-" is a valid b64url
@@ -353,7 +375,7 @@ function serveTLS(socket) {
   log.d(`(${socket.getProtocol()}), tls reused? ${socket.isSessionReused()}`);
 
   const [flag, host] = isOurWcDn ? getMetadata(sni) : ["", sni];
-  const sb = makeScratchBuffer();
+  const sb = new ScratchBuffer();
 
   log.d("----> DoT request", host, flag);
   socket.on("data", (data) => {
@@ -377,7 +399,7 @@ function serveTCP(socket) {
   // doesn't yet support v2, but only v1. ClientHello would contain
   // the SNI which we could then use here.
   const [flag, host] = ["", "ignored.example.com"];
-  const sb = makeScratchBuffer();
+  const sb = new ScratchBuffer();
 
   machinesHeartbeat();
   log.d("----> DoT Cleartext request", host, flag);
@@ -398,7 +420,7 @@ function serveTCP(socket) {
  * Handle DNS over TCP/TLS data stream.
  * @param {TLSSocket} socket
  * @param {Buffer} chunk - A TCP data segment
- * @param {Object} sb - Scratch buffer
+ * @param {ScratchBuffer} sb - Scratch buffer
  * @param {String} host - Hostname
  * @param {String} flag - Blocklist Flag
  */
@@ -433,10 +455,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
   // chunk out dns-query starting rem-th byte
   const data = chunk.slice(rem);
 
-  if (sb.qBuf === null) {
-    sb.qBuf = bufutil.createBuffer(qlen);
-    sb.qBufOffset = bufutil.recycleBuffer(sb.qBuf);
-  }
+  sb.allocOnce(qlen);
 
   sb.qBuf.fill(data, sb.qBufOffset);
   sb.qBufOffset += size;
@@ -497,16 +516,19 @@ async function handleTCPQuery(q, socket, host, flag) {
 }
 
 /**
+ * @param {String} rxid
  * @param {Buffer} q
  * @param {String} host
  * @param {String} flag
- * @return {Promise<Uint8Array>}
+ * @return {Promise<Uint8Array?>}
  */
 async function resolveQuery(rxid, q, host, flag) {
   // Using POST, since GET requests cannot be greater than 2KB,
   // where-as DNS-over-TCP msgs could be upto 64KB in size.
   const freq = new Request(`https://${host}/${flag}`, {
     method: "POST",
+    // TODO: populate req ip in x-nile-client-ip header
+    // TODO: add host header
     headers: util.concatHeaders(
       util.dnsHeaders(),
       util.contentLengthHeader(q),
@@ -520,11 +542,18 @@ async function resolveQuery(rxid, q, host, flag) {
   const ans = await r.arrayBuffer();
 
   if (!bufutil.emptyBuf(ans)) {
-    return new Uint8Array(ans);
+    return bufutil.normalize8(ans);
   } else {
     log.w(rxid, host, "empty ans, send servfail; flags?", flag);
     return dnsutil.servfailQ(q);
   }
+}
+
+async function serve200(req, res) {
+  log.d("-------------> Http-check req", req.method, req.url);
+  nofchecks += 1;
+  res.writeHead(200);
+  res.end();
 }
 
 /**
@@ -575,6 +604,7 @@ async function handleHTTPRequest(b, req, res) {
       // Note: In VM container, Object spread may not be working for all
       // properties, especially of "hidden" Symbol values!? like "headers"?
       ...req,
+      // TODO: populate req ip in x-nile-client-ip header
       headers: util.concatHeaders(
         util.rxidHeader(rxid),
         nodeutil.copyNonPseudoHeaders(req.headers)
@@ -600,14 +630,14 @@ async function handleHTTPRequest(b, req, res) {
     log.lapTime(t, "recv-ans");
 
     if (!bufutil.emptyBuf(ans)) {
-      res.end(bufutil.bufferOf(ans));
+      res.end(bufutil.normalize8(ans));
     } else {
       // expect fRes.status to be set to non 2xx above
       res.end();
     }
   } catch (e) {
-    res.writeHead(400); // bad request
-    res.end();
+    if (!res.headersSent) res.writeHead(400); // bad request
+    if (!res.writableEnded) res.end();
     log.w(e);
   }
 
@@ -618,7 +648,7 @@ function machinesHeartbeat() {
   // increment no of requests
   noreqs += 1;
   if (noreqs % 100 === 0) {
-    log.i(noreqs, "requests so far in", uptime() / 1000, "secs");
+    log.i(noreqs, "requests in", uptime() / 1000, "secs; chk:", nofchecks);
   }
   // nothing to do, if not on fly
   if (!envutil.onFly()) return;

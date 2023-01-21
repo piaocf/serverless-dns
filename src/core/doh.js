@@ -7,14 +7,23 @@
  */
 
 import RethinkPlugin from "./plugin.js";
+import * as pres from "../plugins/plugin-response.js";
 import * as util from "../commons/util.js";
 import * as dnsutil from "../commons/dnsutil.js";
 import IOState from "./io-state.js";
 
+/**
+ * @param {*} event
+ * @returns {Promise<Response>}
+ */
 export function handleRequest(event) {
   return proxyRequest(event);
 }
 
+/**
+ * @param {*} event
+ * @returns {Promise<Response>}
+ */
 async function proxyRequest(event) {
   if (optionsRequest(event.request)) return util.respond204();
 
@@ -23,6 +32,13 @@ async function proxyRequest(event) {
   try {
     const plugin = new RethinkPlugin(event);
     await plugin.initIoState(io);
+
+    // if an early response has been set by plugin.initIoState, return it
+    if (io.httpResponse) {
+      const ua = event.request.headers.get("User-Agent");
+      if (util.fromBrowser(ua)) io.setCorsHeadersIfNeeded();
+      return io.httpResponse;
+    }
 
     await util.timedSafeAsyncOp(
       /* op*/ async () => plugin.execute(),
@@ -45,6 +61,6 @@ function optionsRequest(request) {
 }
 
 function errorResponse(io, err = null) {
-  const eres = util.errResponse("doh.js", err);
+  const eres = pres.errResponse("doh.js", err);
   io.dnsExceptionResponse(eres);
 }
