@@ -53,7 +53,7 @@ export default class RethinkPlugin {
     this.registerPlugin(
       "userOp",
       services.userOp,
-      ["rxid", "request", "isDnsMsg"],
+      ["rxid", "request", "requestDecodedDnsPacket", "isDnsMsg"],
       this.userOpCallback
     );
 
@@ -142,10 +142,7 @@ export default class RethinkPlugin {
 
   async execute() {
     const io = this.io;
-    const rxid = this.ctx.get("rxid");
-
-    const t = this.log.startTime("exec-plugin-" + rxid);
-
+    // const rxid = this.ctx.get("rxid");
     for (const p of this.plugin) {
       if (io.stopProcessing && !p.continueOnStopProcess) {
         continue;
@@ -154,19 +151,12 @@ export default class RethinkPlugin {
         continue;
       }
 
-      this.log.lapTime(t, rxid, p.name, "send-io");
-
       const res = await p.module.exec(makectx(this.ctx, p.pctx));
-
-      this.log.lapTime(t, rxid, p.name, "got-res");
 
       if (typeof p.callback === "function") {
         await p.callback.call(this, res, io);
       }
-
-      this.log.lapTime(t, rxid, p.name, "post-callback");
     }
-    this.log.endTime(t);
   }
 
   /**
@@ -187,7 +177,7 @@ export default class RethinkPlugin {
   /**
    * Adds "userBlocklistInfo", "userBlocklistInfo",  and "dnsResolverUrl"
    * to RethinkPlugin ctx.
-   * @param {RResp} response - Contains data: userBlocklistInfo / userBlockstamp
+   * @param {RResp} response
    * @param {IOState} io
    */
   async userOpCallback(response, io) {
@@ -348,12 +338,17 @@ export default class RethinkPlugin {
     if (isGwReq) io.gatewayAnswersOnly(envutil.gwip4(), envutil.gwip6());
 
     try {
-      const questionPacket = dnsutil.decode(question);
-      this.addCtx("isDnsMsg", true);
-      this.log.d(rxid, "cur-ques", JSON.stringify(questionPacket.questions));
-      io.decodedDnsPacket = questionPacket;
+      const [qpacket, ecsdropped] = dnsutil.dropECS(dnsutil.decode(question));
+      // if ecs was removed, then re-encode the question
+      if (ecsdropped) {
+        question = dnsutil.encode(qpacket);
+      }
 
-      this.addCtx("requestDecodedDnsPacket", questionPacket);
+      io.input(qpacket);
+      this.addCtx("isDnsMsg", true);
+      this.log.d(rxid, "cur-ques", JSON.stringify(qpacket.questions));
+
+      this.addCtx("requestDecodedDnsPacket", qpacket);
       this.addCtx("requestBodyBuffer", question);
     } catch (e) {
       // err if question is not a valid dns-packet
